@@ -25,6 +25,7 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "camera_httpd";
 
@@ -73,15 +74,15 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 20000000,
+    .xclk_freq_hz = 20000000,        // 20MHz XCLK (maximum stable frequency)
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_QVGA,   // 320x240 (smaller for no PSRAM)
-    .jpeg_quality = 12,              // 0-63 lower means higher quality
-    .fb_count = 1,                   // Use 1 frame buffer (no PSRAM)
-    .fb_location = CAMERA_FB_IN_DRAM, // Use DRAM instead of PSRAM
+    .frame_size = FRAMESIZE_UXGA,    // 1600x1200 - UXGA (Maximum for OV2640)
+    .jpeg_quality = 12,              // 0-63 lower=higher quality, 12=balanced for speed
+    .fb_count = 3,                   // Triple buffer for maximum FPS with PSRAM
+    .fb_location = CAMERA_FB_IN_PSRAM, // Use PSRAM for frame buffers
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY
 };
 
@@ -90,12 +91,69 @@ typedef struct {
     size_t len;
 } jpg_chunking_t;
 
+// Check PSRAM availability
+static void check_psram()
+{
+    ESP_LOGI(TAG, "=== PSRAM Diagnostic ===");
+    
+    // Check if PSRAM is available using heap caps
+    size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t largest_free = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    
+    ESP_LOGI(TAG, "PSRAM Total: %d bytes (%.2f MB)", total_psram, total_psram / (1024.0 * 1024.0));
+    ESP_LOGI(TAG, "PSRAM Free: %d bytes (%.2f MB)", free_psram, free_psram / (1024.0 * 1024.0));
+    ESP_LOGI(TAG, "PSRAM Used: %d bytes (%.2f MB)", total_psram - free_psram, (total_psram - free_psram) / (1024.0 * 1024.0));
+    ESP_LOGI(TAG, "PSRAM Largest Free Block: %d bytes (%.2f MB)", largest_free, largest_free / (1024.0 * 1024.0));
+    
+    if (total_psram == 0) {
+        ESP_LOGE(TAG, "PSRAM not detected or not enabled!");
+        return;
+    }
+    
+    // Try to allocate a small test buffer
+    ESP_LOGI(TAG, "Testing PSRAM allocation...");
+    void *test_buf = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    if (test_buf) {
+        ESP_LOGI(TAG, "✓ PSRAM test allocation successful (1KB)");
+        heap_caps_free(test_buf);
+    } else {
+        ESP_LOGE(TAG, "✗ PSRAM test allocation failed!");
+    }
+    
+    // Try larger allocation (16KB)
+    test_buf = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
+    if (test_buf) {
+        ESP_LOGI(TAG, "✓ PSRAM allocation successful (16KB)");
+        heap_caps_free(test_buf);
+    } else {
+        ESP_LOGE(TAG, "✗ PSRAM allocation failed (16KB)!");
+    }
+    
+    // Try 64KB allocation
+    test_buf = heap_caps_malloc(65536, MALLOC_CAP_SPIRAM);
+    if (test_buf) {
+        ESP_LOGI(TAG, "✓ PSRAM large allocation successful (64KB)");
+        heap_caps_free(test_buf);
+    } else {
+        ESP_LOGE(TAG, "✗ PSRAM large allocation failed (64KB)!");
+        ESP_LOGE(TAG, "Largest free block is only: %d bytes", largest_free);
+    }
+    
+    ESP_LOGI(TAG, "========================");
+}
+
 // Initialize camera
 static esp_err_t init_camera()
 {
+    ESP_LOGI(TAG, "Checking PSRAM before camera initialization...");
+    check_psram();
+    
+    ESP_LOGI(TAG, "Initializing camera with PSRAM...");
+    
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera Init Failed");
+        ESP_LOGE(TAG, "Camera Init Failed with error 0x%x", err);
         return err;
     }
     
