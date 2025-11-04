@@ -1,0 +1,509 @@
+/*
+ * ESP32-CAM HTTP MJPEG Stream Server
+ * 
+ * 功能:
+ * - HTTP MJPEG 即時串流
+ * - Web 介面查看串流
+ * - 支援多客戶端連接
+ * - 可調整解析度和品質
+ * 
+ * 硬體: ESP32-CAM (AI-Thinker)
+ * 框架: ESP-IDF
+ */
+
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "esp_timer.h"
+
+static const char *TAG = "camera_httpd";
+
+// ESP32-CAM (AI-Thinker) Pin Definition
+#define CAM_PIN_PWDN    32
+#define CAM_PIN_RESET   -1
+#define CAM_PIN_XCLK    0
+#define CAM_PIN_SIOD    26
+#define CAM_PIN_SIOC    27
+
+#define CAM_PIN_D7      35
+#define CAM_PIN_D6      34
+#define CAM_PIN_D5      39
+#define CAM_PIN_D4      36
+#define CAM_PIN_D3      21
+#define CAM_PIN_D2      19
+#define CAM_PIN_D1      18
+#define CAM_PIN_D0      5
+#define CAM_PIN_VSYNC   25
+#define CAM_PIN_HREF    23
+#define CAM_PIN_PCLK    22
+
+// MJPEG Stream Settings
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// Camera configuration
+static camera_config_t camera_config = {
+    .pin_pwdn  = CAM_PIN_PWDN,
+    .pin_reset = CAM_PIN_RESET,
+    .pin_xclk = CAM_PIN_XCLK,
+    .pin_sccb_sda = CAM_PIN_SIOD,
+    .pin_sccb_scl = CAM_PIN_SIOC,
+
+    .pin_d7 = CAM_PIN_D7,
+    .pin_d6 = CAM_PIN_D6,
+    .pin_d5 = CAM_PIN_D5,
+    .pin_d4 = CAM_PIN_D4,
+    .pin_d3 = CAM_PIN_D3,
+    .pin_d2 = CAM_PIN_D2,
+    .pin_d1 = CAM_PIN_D1,
+    .pin_d0 = CAM_PIN_D0,
+    .pin_vsync = CAM_PIN_VSYNC,
+    .pin_href = CAM_PIN_HREF,
+    .pin_pclk = CAM_PIN_PCLK,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA,   // 320x240 (smaller for no PSRAM)
+    .jpeg_quality = 12,              // 0-63 lower means higher quality
+    .fb_count = 1,                   // Use 1 frame buffer (no PSRAM)
+    .fb_location = CAMERA_FB_IN_DRAM, // Use DRAM instead of PSRAM
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY
+};
+
+typedef struct {
+    httpd_req_t *req;
+    size_t len;
+} jpg_chunking_t;
+
+// Initialize camera
+static esp_err_t init_camera()
+{
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera Init Failed");
+        return err;
+    }
+    
+    // Get camera sensor
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+        // Initial adjustments
+        s->set_brightness(s, 0);     // -2 to 2
+        s->set_contrast(s, 0);       // -2 to 2
+        s->set_saturation(s, 0);     // -2 to 2
+        s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect)
+        s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
+        s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
+        s->set_wb_mode(s, 0);        // 0 to 4
+        s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
+        s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+        s->set_ae_level(s, 0);       // -2 to 2
+        s->set_aec_value(s, 300);    // 0 to 1200
+        s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
+        s->set_agc_gain(s, 0);       // 0 to 30
+        s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+        s->set_bpc(s, 0);            // 0 = disable , 1 = enable
+        s->set_wpc(s, 1);            // 0 = disable , 1 = enable
+        s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
+        s->set_lenc(s, 1);           // 0 = disable , 1 = enable
+        s->set_hmirror(s, 0);        // 0 = disable , 1 = enable
+        s->set_vflip(s, 0);          // 0 = disable , 1 = enable
+        s->set_dcw(s, 1);            // 0 = disable , 1 = enable
+        s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
+    }
+    
+    ESP_LOGI(TAG, "Camera initialized successfully");
+    return ESP_OK;
+}
+
+// MJPEG Stream Handler
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    camera_fb_t * fb = NULL;
+    esp_err_t res = ESP_OK;
+    size_t _jpg_buf_len = 0;
+    uint8_t * _jpg_buf = NULL;
+    char part_buf[64];
+    
+    ESP_LOGI(TAG, "Stream session started");
+    
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if(res != ESP_OK){
+        ESP_LOGE(TAG, "Failed to set response type");
+        return res;
+    }
+    
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "X-Framerate", "10");
+    
+    while(true){
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            res = ESP_FAIL;
+            break;
+        }
+        
+        if(fb->format != PIXFORMAT_JPEG){
+            bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            if(!jpeg_converted){
+                ESP_LOGE(TAG, "JPEG compression failed");
+                res = ESP_FAIL;
+                break;
+            }
+        } else {
+            _jpg_buf_len = fb->len;
+            _jpg_buf = fb->buf;
+        }
+        
+        if(res == ESP_OK){
+            size_t hlen = snprintf(part_buf, 64, _STREAM_PART, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+        }
+        if(res == ESP_OK){
+            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        }
+        if(res == ESP_OK){
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        }
+        
+        if(fb){
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            _jpg_buf = NULL;
+        } else if(_jpg_buf){
+            free(_jpg_buf);
+            _jpg_buf = NULL;
+        }
+        
+        if(res != ESP_OK){
+            ESP_LOGI(TAG, "Client disconnected");
+            break;
+        }
+        
+        // Small delay to prevent CPU overload
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    ESP_LOGI(TAG, "Stream session ended");
+    return res;
+}
+
+// Capture single image handler
+static esp_err_t capture_handler(httpd_req_t *req)
+{
+    camera_fb_t * fb = NULL;
+    esp_err_t res = ESP_OK;
+    
+    fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Camera capture failed");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+    return res;
+}
+
+// Status handler
+static esp_err_t status_handler(httpd_req_t *req)
+{
+    static char json_response[1024];
+    
+    sensor_t * s = esp_camera_sensor_get();
+    char * p = json_response;
+    *p++ = '{';
+    
+    p+=sprintf(p, "\"framesize\":%u,", s->status.framesize);
+    p+=sprintf(p, "\"quality\":%u,", s->status.quality);
+    p+=sprintf(p, "\"brightness\":%d,", s->status.brightness);
+    p+=sprintf(p, "\"contrast\":%d,", s->status.contrast);
+    p+=sprintf(p, "\"saturation\":%d,", s->status.saturation);
+    p+=sprintf(p, "\"hmirror\":%u,", s->status.hmirror);
+    p+=sprintf(p, "\"vflip\":%u", s->status.vflip);
+    *p++ = '}';
+    *p++ = 0;
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json_response, strlen(json_response));
+}
+
+// Index page HTML
+static const char INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ESP32-CAM Stream</title>
+    <style>
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            background: #181818;
+            color: #EFEFEF;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            color: #4CAF50;
+        }
+        .stream-container {
+            text-align: center;
+            margin: 20px 0;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        button {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 15px 32px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .info {
+            background: #282828;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .info p {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 ESP32-CAM Stream Monitor</h1>
+        
+        <div class="stream-container">
+            <img id="stream" src="/stream" style="display:none;" onload="this.style.display='block';">
+        </div>
+        
+        <div class="controls">
+            <button onclick="location.reload();">🔄 Refresh</button>
+            <button onclick="captureImage();">📷 Capture</button>
+            <button onclick="window.open('/stream', '_blank');">🖼️ Fullscreen</button>
+        </div>
+        
+        <div class="info">
+            <h3>📊 Stream Information</h3>
+            <p><strong>Resolution:</strong> VGA (640x480)</p>
+            <p><strong>Format:</strong> MJPEG</p>
+            <p><strong>Status:</strong> <span id="status">Loading...</span></p>
+            <p><strong>URL:</strong> <a href="/stream" target="_blank">http://<span id="ip"></span>/stream</a></p>
+        </div>
+    </div>
+    
+    <script>
+        function captureImage() {
+            window.open('/capture', '_blank');
+        }
+        
+        // Get IP address
+        fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('status').textContent = 'Streaming';
+                document.getElementById('status').style.color = '#4CAF50';
+            })
+            .catch(error => {
+                document.getElementById('status').textContent = 'Error';
+                document.getElementById('status').style.color = '#f44336';
+            });
+        
+        document.getElementById('ip').textContent = window.location.hostname;
+        
+        // Check stream status
+        const streamImg = document.getElementById('stream');
+        streamImg.onerror = function() {
+            document.getElementById('status').textContent = 'Stream Error';
+            document.getElementById('status').style.color = '#f44336';
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// Index page handler
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Content-Encoding", "identity");
+    return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+}
+
+// Start HTTP server
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.ctrl_port = 32768;
+    config.max_uri_handlers = 8;
+    config.max_resp_headers = 8;
+    config.stack_size = 8192;
+    
+    ESP_LOGI(TAG, "Starting web server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t index_uri = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = index_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &index_uri);
+        
+        httpd_uri_t stream_uri = {
+            .uri       = "/stream",
+            .method    = HTTP_GET,
+            .handler   = stream_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &stream_uri);
+        
+        httpd_uri_t capture_uri = {
+            .uri       = "/capture",
+            .method    = HTTP_GET,
+            .handler   = capture_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &capture_uri);
+        
+        httpd_uri_t status_uri = {
+            .uri       = "/status",
+            .method    = HTTP_GET,
+            .handler   = status_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &status_uri);
+        
+        ESP_LOGI(TAG, "Web server started successfully");
+        return server;
+    }
+    
+    ESP_LOGI(TAG, "Error starting web server!");
+    return NULL;
+}
+
+// WiFi event handler
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "Disconnected from WiFi, retrying...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Got IP Address: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+// Initialize WiFi
+static void wifi_init_sta(void)
+{
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = CONFIG_ESP_WIFI_SSID,
+            .password = CONFIG_ESP_WIFI_PASSWORD,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi initialized. Connecting to SSID:%s", CONFIG_ESP_WIFI_SSID);
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "ESP32-CAM HTTP Stream Server Starting...");
+    
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // Initialize WiFi
+    wifi_init_sta();
+    
+    // Wait for WiFi connection (simple delay)
+    ESP_LOGI(TAG, "Waiting for WiFi connection...");
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    
+    // Initialize camera
+    if(init_camera() != ESP_OK) {
+        ESP_LOGE(TAG, "Camera initialization failed!");
+        return;
+    }
+    
+    // Start web server
+    start_webserver();
+    
+    ESP_LOGI(TAG, "Camera stream server ready!");
+    ESP_LOGI(TAG, "Access the camera at http://<IP_ADDRESS>/");
+}

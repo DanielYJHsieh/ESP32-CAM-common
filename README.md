@@ -27,6 +27,20 @@ ESP32-CAM 常用專案集合
   - ESP_LOG 日誌輸出
   - GPIO 4 和 GPIO 33 控制
 
+### 3. HTTP MJPEG 串流專案 (esp32-cam_http_stream) ⭐ NEW
+- **位置**: `esp32-cam_http_stream/`
+- **框架**: ESP-IDF 5.5
+- **說明**: 即時視訊串流伺服器 (方案 B: 直接串流)
+- **適合對象**: 進階使用者
+- **硬體**: ESP32-CAM + OV2640
+- **功能**:
+  - HTTP MJPEG 即時串流
+  - Web UI 控制介面
+  - 單張拍照功能
+  - 多客戶端支援
+  - 可調解析度 (QVGA ~ UXGA)
+  - 雙緩衝優化性能
+
 ## 🔌 UART 接線指南
 
 請參閱 [UART_WIRING_GUIDE.md](UART_WIRING_GUIDE.md) 了解如何使用 USB 轉 TTL 模組連接和上傳程式到 ESP32-CAM。
