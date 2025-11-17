@@ -338,6 +338,15 @@ static esp_err_t capture_handler(httpd_req_t *req)
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     
+    // Flush old frames from buffer (fb_count = 3, so flush 3 times)
+    for (int i = 0; i < 3; i++) {
+        fb = esp_camera_fb_get();
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+    }
+    
+    // Now get the fresh frame
     fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Camera capture failed");
@@ -385,7 +394,7 @@ static const char INDEX_HTML[] = R"rawliteral(
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ESP32-CAM Stream</title>
+    <title>ESP32-CAM Control</title>
     <style>
         body {
             font-family: Arial, Helvetica, sans-serif;
@@ -403,95 +412,152 @@ static const char INDEX_HTML[] = R"rawliteral(
             text-align: center;
             color: #4CAF50;
         }
-        .stream-container {
-            text-align: center;
-            margin: 20px 0;
-        }
-        img {
-            max-width: 100%;
-            height: auto;
-            border: 2px solid #4CAF50;
-            border-radius: 8px;
-        }
         .controls {
             text-align: center;
-            margin: 20px 0;
+            margin: 30px 0;
         }
         button {
             background-color: #4CAF50;
             border: none;
             color: white;
-            padding: 15px 32px;
+            padding: 20px 40px;
             text-align: center;
             text-decoration: none;
             display: inline-block;
-            font-size: 16px;
-            margin: 4px 2px;
+            font-size: 18px;
+            margin: 10px;
             cursor: pointer;
-            border-radius: 4px;
+            border-radius: 8px;
+            transition: all 0.3s;
         }
         button:hover {
             background-color: #45a049;
+            transform: scale(1.05);
+        }
+        button:active {
+            transform: scale(0.95);
+        }
+        button.stop {
+            background-color: #f44336;
+        }
+        button.stop:hover {
+            background-color: #da190b;
+        }
+        .stream-container {
+            text-align: center;
+            margin: 20px 0;
+            min-height: 400px;
+        }
+        #display {
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #4CAF50;
+            border-radius: 8px;
+            display: none;
         }
         .info {
             background: #282828;
             padding: 15px;
             border-radius: 8px;
             margin: 20px 0;
+            text-align: center;
         }
         .info p {
             margin: 5px 0;
+        }
+        #status {
+            font-weight: bold;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎥 ESP32-CAM Stream Monitor</h1>
-        
-        <div class="stream-container">
-            <img id="stream" src="/stream" style="display:none;" onload="this.style.display='block';">
-        </div>
+        <h1>🎥 ESP32-CAM Control Panel</h1>
         
         <div class="controls">
-            <button onclick="location.reload();">🔄 Refresh</button>
+            <button onclick="startStream();">📹 Stream</button>
+            <button onclick="stopStream();" class="stop">⏹ Stop</button>
             <button onclick="captureImage();">📷 Capture</button>
-            <button onclick="window.open('/stream', '_blank');">🖼️ Fullscreen</button>
+        </div>
+        
+        <div class="stream-container">
+            <img id="display">
         </div>
         
         <div class="info">
-            <h3>📊 Stream Information</h3>
-            <p><strong>Resolution:</strong> VGA (640x480)</p>
-            <p><strong>Format:</strong> MJPEG</p>
-            <p><strong>Status:</strong> <span id="status">Loading...</span></p>
-            <p><strong>URL:</strong> <a href="/stream" target="_blank">http://<span id="ip"></span>/stream</a></p>
+            <p><strong>Status:</strong> <span id="status" style="color: #4CAF50;">Ready</span></p>
+            <p><strong>IP:</strong> <span id="ip"></span></p>
         </div>
     </div>
     
     <script>
-        function captureImage() {
-            window.open('/capture', '_blank');
+        const display = document.getElementById('display');
+        const statusText = document.getElementById('status');
+        let isStreaming = false;
+        let streamUrl = '';
+        
+        function startStream() {
+            if (!isStreaming) {
+                streamUrl = '/stream?t=' + new Date().getTime();
+                display.src = streamUrl;
+                display.style.display = 'block';
+                isStreaming = true;
+                display.onload = function() {
+                    statusText.textContent = 'Streaming';
+                    statusText.style.color = '#4CAF50';
+                };
+                display.onerror = function() {
+                    statusText.textContent = 'Stream Error';
+                    statusText.style.color = '#f44336';
+                    isStreaming = false;
+                };
+            }
         }
         
-        // Get IP address
-        fetch('/status')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('status').textContent = 'Streaming';
-                document.getElementById('status').style.color = '#4CAF50';
-            })
-            .catch(error => {
-                document.getElementById('status').textContent = 'Error';
-                document.getElementById('status').style.color = '#f44336';
-            });
+        function stopStream() {
+            if (isStreaming) {
+                // Stop streaming by clearing the source
+                isStreaming = false;
+                display.src = '';
+                // Capture current frame before stopping
+                fetch('/capture')
+                    .then(response => response.blob())
+                    .then(blob => {
+                        display.src = URL.createObjectURL(blob);
+                        display.style.display = 'block';
+                        statusText.textContent = 'Stopped (Last Frame)';
+                        statusText.style.color = '#FF9800';
+                    })
+                    .catch(error => {
+                        statusText.textContent = 'Stop Error';
+                        statusText.style.color = '#f44336';
+                    });
+            }
+        }
+        
+        function captureImage() {
+            // Stop streaming if active
+            if (isStreaming) {
+                isStreaming = false;
+                display.src = '';
+            }
+            
+            // Fetch and display capture
+            fetch('/capture?t=' + new Date().getTime())
+                .then(response => response.blob())
+                .then(blob => {
+                    display.src = URL.createObjectURL(blob);
+                    display.style.display = 'block';
+                    statusText.textContent = 'Image Captured';
+                    statusText.style.color = '#2196F3';
+                })
+                .catch(error => {
+                    statusText.textContent = 'Capture Error';
+                    statusText.style.color = '#f44336';
+                });
+        }
         
         document.getElementById('ip').textContent = window.location.hostname;
-        
-        // Check stream status
-        const streamImg = document.getElementById('stream');
-        streamImg.onerror = function() {
-            document.getElementById('status').textContent = 'Stream Error';
-            document.getElementById('status').style.color = '#f44336';
-        };
     </script>
 </body>
 </html>
