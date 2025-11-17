@@ -26,6 +26,8 @@
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
 
 static const char *TAG = "camera_httpd";
 
@@ -90,6 +92,60 @@ typedef struct {
     httpd_req_t *req;
     size_t len;
 } jpg_chunking_t;
+
+// Check if client is from local network
+static bool is_local_client(httpd_req_t *req)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    struct sockaddr_in6 addr;
+    socklen_t addr_size = sizeof(addr);
+    
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_size) != 0) {
+        ESP_LOGW(TAG, "Failed to get peer address");
+        return false;
+    }
+    
+    // Get ESP32's IP address
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == NULL || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get local IP info");
+        return false;
+    }
+    
+    // Handle IPv4-mapped IPv6 addresses
+    uint32_t client_ip;
+    if (addr.sin6_family == AF_INET6) {
+        // Check if it's IPv4-mapped IPv6 (::ffff:x.x.x.x)
+        uint8_t *addr_bytes = (uint8_t *)&addr.sin6_addr;
+        if (addr_bytes[10] == 0xff && addr_bytes[11] == 0xff) {
+            // Extract IPv4 address from IPv4-mapped IPv6
+            client_ip = *((uint32_t *)(addr_bytes + 12));
+        } else {
+            ESP_LOGW(TAG, "Pure IPv6 not supported for local check");
+            return false;
+        }
+    } else if (addr.sin6_family == AF_INET) {
+        struct sockaddr_in *addr_in = (struct sockaddr_in *)&addr;
+        client_ip = addr_in->sin_addr.s_addr;
+    } else {
+        ESP_LOGW(TAG, "Unknown address family");
+        return false;
+    }
+    
+    // Compare network portion (assuming /24 subnet)
+    uint32_t local_ip = ip_info.ip.addr;
+    uint32_t netmask = ip_info.netmask.addr;
+    
+    bool is_local = (client_ip & netmask) == (local_ip & netmask);
+    
+    if (!is_local) {
+        ESP_LOGW(TAG, "Access denied: Client IP 0x%08lx not in local network (0x%08lx/0x%08lx)",
+                 (unsigned long)client_ip, (unsigned long)local_ip, (unsigned long)netmask);
+    }
+    
+    return is_local;
+}
 
 // Check PSRAM availability
 static void check_psram()
@@ -192,6 +248,12 @@ static esp_err_t init_camera()
 // MJPEG Stream Handler
 static esp_err_t stream_handler(httpd_req_t *req)
 {
+    // Check if client is from local network
+    if (!is_local_client(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access denied: Only local network access allowed");
+        return ESP_FAIL;
+    }
+    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     size_t _jpg_buf_len = 0;
@@ -267,6 +329,12 @@ static esp_err_t stream_handler(httpd_req_t *req)
 // Capture single image handler
 static esp_err_t capture_handler(httpd_req_t *req)
 {
+    // Check if client is from local network
+    if (!is_local_client(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access denied: Only local network access allowed");
+        return ESP_FAIL;
+    }
+    
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     
