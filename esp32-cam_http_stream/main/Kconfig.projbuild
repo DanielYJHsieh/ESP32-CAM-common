@@ -21,3 +21,27 @@ config ESP_MAXIMUM_RETRY
         Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
 
 endmenu
+
+menu "HTTP Authentication"
+
+config HTTP_AUTH_ENABLED
+    bool "Enable HTTP Basic Authentication"
+    default y
+    help
+        Enable HTTP Basic Authentication for web interface access.
+
+config HTTP_AUTH_USERNAME
+    string "HTTP Username"
+    default "admin"
+    depends on HTTP_AUTH_ENABLED
+    help
+        Username for HTTP Basic Authentication.
+
+config HTTP_AUTH_PASSWORD
+    string "HTTP Password"
+    default "admin"
+    depends on HTTP_AUTH_ENABLED
+    help
+        Password for HTTP Basic Authentication.
+
+endmenu

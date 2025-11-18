@@ -28,6 +28,7 @@
 #include "esp_heap_caps.h"
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#include "mbedtls/base64.h"
 
 static const char *TAG = "camera_httpd";
 
@@ -147,6 +148,93 @@ static bool is_local_client(httpd_req_t *req)
     return is_local;
 }
 
+// Check HTTP Basic Authentication
+static bool check_basic_auth(httpd_req_t *req)
+{
+#ifdef CONFIG_HTTP_AUTH_ENABLED
+    char auth_header[256];
+    int ret = httpd_req_get_hdr_value_str(req, "Authorization", auth_header, sizeof(auth_header));
+    
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "No Authorization header found");
+        return false;
+    }
+    
+    // Check if it starts with "Basic "
+    if (strncmp(auth_header, "Basic ", 6) != 0) {
+        ESP_LOGW(TAG, "Invalid Authorization header format");
+        return false;
+    }
+    
+    // Decode Base64
+    unsigned char decoded[128];
+    size_t decoded_len;
+    ret = mbedtls_base64_decode(decoded, sizeof(decoded), &decoded_len, 
+                                  (const unsigned char *)(auth_header + 6), 
+                                  strlen(auth_header + 6));
+    
+    if (ret != 0) {
+        ESP_LOGW(TAG, "Base64 decode failed");
+        return false;
+    }
+    
+    decoded[decoded_len] = '\0';
+    
+    // Expected format: "username:password"
+    char expected[128];
+    snprintf(expected, sizeof(expected), "%s:%s", 
+             CONFIG_HTTP_AUTH_USERNAME, CONFIG_HTTP_AUTH_PASSWORD);
+    
+    if (strcmp((char *)decoded, expected) == 0) {
+        ESP_LOGI(TAG, "Authentication successful");
+        return true;
+    }
+    
+    ESP_LOGW(TAG, "Authentication failed: Invalid credentials");
+    return false;
+#else
+    return true;  // Auth disabled
+#endif
+}
+
+// Send 401 Unauthorized response
+static esp_err_t send_auth_required(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-CAM\"");
+    
+    const char *response = 
+        "<!DOCTYPE html><html><head><title>401 Unauthorized</title></head>"
+        "<body><h1>401 Unauthorized</h1>"
+        "<p>Authentication required to access this resource.</p>"
+        "</body></html>";
+    
+    return httpd_resp_send(req, response, strlen(response));
+}
+
+// Logout handler - clears browser authentication cache
+static esp_err_t logout_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Logout requested");
+    
+    // Send 401 to clear browser's cached credentials
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-CAM\"");
+    
+    const char *response = 
+        "<!DOCTYPE html><html><head><title>Logged Out</title>"
+        "<meta http-equiv='refresh' content='2;url=/'>"
+        "</head><body style='font-family: Arial; text-align: center; padding: 50px;'>"
+        "<h1>Logged Out Successfully</h1>"
+        "<p>Your credentials have been cleared.</p>"
+        "<p>Redirecting to login page...</p>"
+        "</body></html>";
+    
+    return httpd_resp_send(req, response, strlen(response));
+}
+
 // Check PSRAM availability
 static void check_psram()
 {
@@ -248,6 +336,11 @@ static esp_err_t init_camera()
 // MJPEG Stream Handler
 static esp_err_t stream_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+    
     // Check if client is from local network
     if (!is_local_client(req)) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access denied: Only local network access allowed");
@@ -329,6 +422,11 @@ static esp_err_t stream_handler(httpd_req_t *req)
 // Capture single image handler
 static esp_err_t capture_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+    
     // Check if client is from local network
     if (!is_local_client(req)) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access denied: Only local network access allowed");
@@ -366,6 +464,11 @@ static esp_err_t capture_handler(httpd_req_t *req)
 // Status handler
 static esp_err_t status_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+    
     static char json_response[1024];
     
     sensor_t * s = esp_camera_sensor_get();
@@ -566,6 +669,11 @@ static const char INDEX_HTML[] = R"rawliteral(
 // Index page handler
 static esp_err_t index_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+    
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "identity");
     return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
